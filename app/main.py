@@ -105,44 +105,68 @@ async def predict_next_api_call(request: PredictionRequest):
     
     try:
         logger.info(f"Processing prediction request for user {request.user_id}")
+        logger.info(f"Events: {len(request.events)}, Prompt: '{request.prompt}', Spec: {request.spec_url}")
         
         # Validate input
         if len(request.events) == 0:
+            logger.error("No events provided")
             raise HTTPException(status_code=400, detail="At least one event is required")
         
+        logger.info("Step 1: Parsing OpenAPI spec...")
         # Parse OpenAPI spec
-        spec_data = await openapi_parser.parse_spec(request.spec_url)
+        try:
+            spec_data = await openapi_parser.parse_spec(request.spec_url)
+            logger.info(f"OpenAPI parsed: {spec_data.get('title', 'Unknown')} with {len(spec_data.get('endpoints', []))} endpoints")
+        except Exception as e:
+            logger.error(f"OpenAPI parsing failed: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to parse OpenAPI spec: {str(e)}")
         
+        logger.info("Step 2: Generating candidates...")
         # Generate candidates using AI layer
-        candidates = await candidate_generator.generate_candidates(
-            events=request.events,
-            prompt=request.prompt,
-            spec_data=spec_data,
-            k=request.k
-        )
+        try:
+            candidates = await candidate_generator.generate_candidates(
+                events=request.events,
+                prompt=request.prompt,
+                spec_data=spec_data,
+                k=request.k
+            )
+            logger.info(f"Generated {len(candidates)} candidates")
+        except Exception as e:
+            logger.error(f"Candidate generation failed: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to generate candidates: {str(e)}")
         
+        logger.info("Step 3: Ranking candidates...")
         # Rank candidates using ML layer
-        ranked_predictions = await prediction_ranker.rank_candidates(
-            candidates=candidates,
-            events=request.events,
-            prompt=request.prompt,
-            user_id=request.user_id
-        )
+        try:
+            ranked_predictions = await prediction_ranker.rank_candidates(
+                candidates=candidates,
+                events=request.events,
+                prompt=request.prompt,
+                user_id=request.user_id
+            )
+            logger.info(f"Ranked {len(ranked_predictions)} predictions")
+        except Exception as e:
+            logger.error(f"Ranking failed: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to rank candidates: {str(e)}")
         
         # Return top k predictions
         top_predictions = ranked_predictions[:request.k]
         
         processing_time = int((time.time() - start_time) * 1000)
         
-        logger.info(f"Prediction completed in {processing_time}ms")
+        logger.info(f"Prediction completed successfully in {processing_time}ms with {len(top_predictions)} predictions")
         
         return PredictionResponse(
             predictions=top_predictions,
             processing_time_ms=processing_time
         )
         
+    except HTTPException:
+        # Re-raise HTTP exceptions
+        raise
     except Exception as e:
-        logger.error(f"Error processing prediction: {str(e)}")
+        processing_time = int((time.time() - start_time) * 1000)
+        logger.error(f"Unexpected error in prediction after {processing_time}ms: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
 @app.get("/")
