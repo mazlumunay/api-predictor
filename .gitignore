@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment variables
+.env
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+docker-compose.override.yml
+
+# Data and logs
+data/*.pkl
+data/*.csv
+data/*.json
+logs/
+*.log
+
+# ML models
+*.joblib
+*.pickle
+
+# Temporary files
+tmp/
+temp/
