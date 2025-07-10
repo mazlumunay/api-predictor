@@ -6,7 +6,9 @@ import time
 import logging
 import os
 from datetime import datetime
+from contextlib import asynccontextmanager
 
+# Import our components (we'll create minimal versions)
 from app.ai_layer.candidate_generator import CandidateGenerator
 from app.ml_layer.ranker import PredictionRanker
 from app.utils.openapi_parser import OpenAPIParser
@@ -16,10 +18,31 @@ from app.utils.cache import CacheManager
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Initialize components
+cache_manager = CacheManager()
+openapi_parser = OpenAPIParser(cache_manager)
+candidate_generator = CandidateGenerator()
+prediction_ranker = PredictionRanker()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    logger.info("Starting API Predictor service...")
+    await cache_manager.init()
+    await prediction_ranker.load_model()
+    logger.info("Service initialized successfully")
+    
+    yield
+    
+    # Shutdown
+    logger.info("Shutting down API Predictor service...")
+    await cache_manager.close()
+
 app = FastAPI(
     title="API Predictor",
     description="Predicts next API calls for SaaS users",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan
 )
 
 app.add_middleware(
@@ -58,29 +81,11 @@ class Prediction(BaseModel):
     why: str = Field(..., description="Human-readable explanation")
 
 class PredictionResponse(BaseModel):
+    model_config = {'protected_namespaces': ()}
+    
     predictions: List[Prediction]
     processing_time_ms: int
     model_version: str = "1.0.0"
-
-# Initialize components
-cache_manager = CacheManager()
-openapi_parser = OpenAPIParser(cache_manager)
-candidate_generator = CandidateGenerator()
-prediction_ranker = PredictionRanker()
-
-@app.on_startup
-async def startup_event():
-    """Initialize the application"""
-    logger.info("Starting API Predictor service...")
-    await cache_manager.init()
-    await prediction_ranker.load_model()
-    logger.info("Service initialized successfully")
-
-@app.on_shutdown
-async def shutdown_event():
-    """Cleanup on shutdown"""
-    logger.info("Shutting down API Predictor service...")
-    await cache_manager.close()
 
 @app.get("/health")
 async def health_check():
