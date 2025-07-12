@@ -1,6 +1,9 @@
 import os
 import logging
 from typing import List, Dict, Any, Optional
+import pandas as pd
+import numpy as np
+from .trainer import MLModelTrainer
 
 logger = logging.getLogger(__name__)
 
@@ -10,18 +13,24 @@ class PredictionRanker:
     """
     
     def __init__(self):
-        self.model = None
+        self.ml_trainer = MLModelTrainer()
         self.is_trained = False
         
     async def load_model(self):
-        """Load pre-trained model or initialize heuristic ranking"""
+        """Load pre-trained model or train if not available"""
         try:
-            # For now, we'll use heuristic ranking
-            # Later we can add proper ML model loading
-            logger.info("Prediction ranker initialized with heuristic ranking")
-            self.is_trained = True
+            # Try to load existing model
+            if self.ml_trainer.load_model():
+                logger.info("ML model loaded successfully")
+                self.is_trained = True
+            else:
+                # Train a new model if none exists
+                logger.info("No ML model found, training new model...")
+                metrics = self.ml_trainer.train_model(n_samples=1000)  # Smaller for faster startup
+                logger.info(f"New model trained with metrics: {metrics}")
+                self.is_trained = True
         except Exception as e:
-            logger.error(f"Error loading model: {e}")
+            logger.error(f"Error with ML model: {e}. Falling back to heuristics.")
             self.is_trained = False
     
     async def rank_candidates(
@@ -38,8 +47,14 @@ class PredictionRanker:
             return []
         
         try:
-            # Use heuristic ranking for now
-            scored_candidates = self._heuristic_rank(candidates, events, prompt)
+            if self.is_trained and self.ml_trainer.model is not None:
+                # Use ML model for ranking
+                scored_candidates = self._ml_rank(candidates, events, prompt)
+                logger.info(f"Used ML model for ranking {len(candidates)} candidates")
+            else:
+                # Fallback to heuristic ranking
+                scored_candidates = self._heuristic_rank(candidates, events, prompt)
+                logger.info(f"Used heuristic ranking for {len(candidates)} candidates")
             
             # Sort by score (descending)
             scored_candidates.sort(key=lambda x: x['score'], reverse=True)
@@ -54,10 +69,143 @@ class PredictionRanker:
                     'endpoint': c['endpoint'],
                     'params': c.get('params', {}),
                     'score': 0.5,
-                    'why': c.get('reasoning', 'Default ranking')
+                    'why': c.get('reasoning', 'Default ranking due to error')
                 }
                 for c in candidates
             ]
+    
+    def _ml_rank(
+        self, 
+        candidates: List[Dict[str, Any]], 
+        events: List[Any], 
+        prompt: Optional[str]
+    ) -> List[Dict[str, Any]]:
+        """Rank using trained ML model"""
+        scored_candidates = []
+        
+        for candidate in candidates:
+            try:
+                # Extract features for this candidate
+                features = self._extract_ml_features(candidate, events, prompt)
+                
+                # Predict score using ML model
+                feature_vector = pd.DataFrame([features])
+                # Ensure all required columns are present
+                for col in self.ml_trainer.feature_columns:
+                    if col not in feature_vector.columns:
+                        feature_vector[col] = 0
+                
+                # Reorder columns to match training
+                feature_vector = feature_vector[self.ml_trainer.feature_columns]
+                
+                ml_score = self.ml_trainer.model.predict(feature_vector)[0]
+                
+                # Combine with heuristic score for robustness
+                heuristic_score = self._calculate_heuristic_score(candidate, events, prompt)
+                final_score = 0.7 * ml_score + 0.3 * heuristic_score
+                final_score = max(0.0, min(1.0, final_score))  # Clamp to [0,1]
+                
+                scored_candidates.append({
+                    'endpoint': candidate['endpoint'],
+                    'params': candidate.get('params', {}),
+                    'score': final_score,
+                    'why': f"ML prediction ({ml_score:.3f}) + heuristics ({heuristic_score:.3f}) = {final_score:.3f}"
+                })
+                
+            except Exception as e:
+                logger.error(f"Error in ML scoring for {candidate.get('endpoint', 'unknown')}: {e}")
+                # Fallback to heuristic for this candidate
+                heuristic_score = self._calculate_heuristic_score(candidate, events, prompt)
+                scored_candidates.append({
+                    'endpoint': candidate['endpoint'],
+                    'params': candidate.get('params', {}),
+                    'score': heuristic_score,
+                    'why': f"Heuristic fallback: {heuristic_score:.3f}"
+                })
+        
+        return scored_candidates
+    
+    def _extract_ml_features(
+        self, 
+        candidate: Dict[str, Any], 
+        events: List[Any], 
+        prompt: Optional[str]
+    ) -> Dict[str, Any]:
+        """Extract features for ML model prediction"""
+        
+        last_event = events[-1] if events else None
+        
+        features = {
+            # Basic sequence features
+            'sequence_length': len(events),
+            'time_since_last_min': 1.0,  # Simplified - could calculate actual time
+            
+            # Method distribution in history
+            'get_count': sum(1 for e in events if e.endpoint.split()[0] == 'GET'),
+            'post_count': sum(1 for e in events if e.endpoint.split()[0] == 'POST'),
+            'put_count': sum(1 for e in events if e.endpoint.split()[0] == 'PUT'),
+            'delete_count': sum(1 for e in events if e.endpoint.split()[0] == 'DELETE'),
+            
+            # Pattern features
+            'same_method_streak': self._calculate_same_method_streak(events),
+            'crud_pattern_score': self._calculate_crud_pattern_score(events),
+            
+            # Prompt features
+            'has_prompt': prompt is not None,
+            'prompt_create_keywords': 0,
+            'prompt_read_keywords': 0,
+            'prompt_update_keywords': 0,
+            'prompt_delete_keywords': 0,
+        }
+        
+        # Last action features (encoded)
+        if last_event:
+            last_method = last_event.endpoint.split()[0]
+            last_path = ' '.join(last_event.endpoint.split()[1:]) if ' ' in last_event.endpoint else '/'
+            
+            # Encode using label encoders (with fallback for unseen values)
+            try:
+                if 'last_method' in self.ml_trainer.label_encoders:
+                    encoder = self.ml_trainer.label_encoders['last_method']
+                    if last_method in encoder.classes_:
+                        features['last_method_encoded'] = encoder.transform([last_method])[0]
+                    else:
+                        features['last_method_encoded'] = 0  # Unknown method
+                else:
+                    features['last_method_encoded'] = 0
+                
+                if 'last_path' in self.ml_trainer.label_encoders:
+                    encoder = self.ml_trainer.label_encoders['last_path']
+                    if last_path in encoder.classes_:
+                        features['last_path_encoded'] = encoder.transform([last_path])[0]
+                    else:
+                        features['last_path_encoded'] = 0  # Unknown path
+                else:
+                    features['last_path_encoded'] = 0
+                    
+            except Exception as e:
+                logger.debug(f"Error encoding features: {e}")
+                features['last_method_encoded'] = 0
+                features['last_path_encoded'] = 0
+        else:
+            features['last_method_encoded'] = 0
+            features['last_path_encoded'] = 0
+        
+        # Prompt keyword analysis
+        if prompt:
+            prompt_lower = prompt.lower()
+            
+            create_keywords = ['create', 'new', 'add', 'make']
+            read_keywords = ['get', 'list', 'view', 'show', 'find']
+            update_keywords = ['update', 'edit', 'modify', 'change']
+            delete_keywords = ['delete', 'remove', 'destroy']
+            
+            features['prompt_create_keywords'] = sum(1 for kw in create_keywords if kw in prompt_lower)
+            features['prompt_read_keywords'] = sum(1 for kw in read_keywords if kw in prompt_lower)
+            features['prompt_update_keywords'] = sum(1 for kw in update_keywords if kw in prompt_lower)
+            features['prompt_delete_keywords'] = sum(1 for kw in delete_keywords if kw in prompt_lower)
+        
+        return features
     
     def _heuristic_rank(
         self, 
@@ -100,7 +248,7 @@ class PredictionRanker:
         
         # Recent endpoint pattern matching
         if events:
-            last_endpoint = events[-1].endpoint  # Fixed: use .endpoint
+            last_endpoint = events[-1].endpoint  # Fixed: use .endpoint instead of ['endpoint']
             last_method = last_endpoint.split()[0]
             
             # Bonus for logical progression (GET -> POST, etc.)
@@ -150,6 +298,48 @@ class PredictionRanker:
             score += 0.1
         
         return min(score, 1.0)
+    
+    def _calculate_same_method_streak(self, events: List[Any]) -> int:
+        """Calculate streak of same HTTP method"""
+        if not events:
+            return 0
+        
+        last_method = events[-1].endpoint.split()[0]
+        streak = 1
+        
+        for i in range(len(events) - 2, -1, -1):
+            if events[i].endpoint.split()[0] == last_method:
+                streak += 1
+            else:
+                break
+        
+        return streak
+    
+    def _calculate_crud_pattern_score(self, events: List[Any]) -> float:
+        """Calculate how well the sequence follows CRUD patterns"""
+        if len(events) < 2:
+            return 0.5
+        
+        score = 0.0
+        transitions = 0
+        
+        for i in range(1, len(events)):
+            prev_method = events[i-1].endpoint.split()[0]
+            curr_method = events[i].endpoint.split()[0]
+            
+            # Score common transitions
+            if prev_method == 'GET' and curr_method in ['POST', 'PUT']:
+                score += 1.0
+            elif prev_method == 'POST' and curr_method == 'GET':
+                score += 0.8
+            elif prev_method == 'PUT' and curr_method == 'GET':
+                score += 0.8
+            elif prev_method == curr_method and curr_method == 'GET':
+                score += 0.5
+            
+            transitions += 1
+        
+        return score / transitions if transitions > 0 else 0.5
     
     def _generate_heuristic_explanation(
         self, 
