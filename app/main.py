@@ -17,6 +17,7 @@ from app.utils.performance import (
     performance_monitor, AsyncPerformanceTracker, 
     optimize_for_performance, with_timeout
 )
+from app.utils.validation import InputValidator, ParameterGenerator
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -27,6 +28,8 @@ cache_manager = CacheManager()
 openapi_parser = OpenAPIParser(cache_manager)
 candidate_generator = CandidateGenerator()
 prediction_ranker = PredictionRanker()
+input_validator = InputValidator()
+parameter_generator = ParameterGenerator()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -130,10 +133,18 @@ async def predict_next_api_call(request: PredictionRequest):
             logger.info(f"Processing prediction request for user {request.user_id}")
             logger.info(f"Events: {len(request.events)}, Prompt: '{request.prompt}', Spec: {request.spec_url}")
             
-            # Validate input
-            if len(request.events) == 0:
-                logger.error("No events provided")
-                raise HTTPException(status_code=400, detail="At least one event is required")
+            # Enhanced input validation
+            request_dict = request.dict()
+            is_valid, validation_errors = input_validator.validate_request(request_dict)
+            if not is_valid:
+                logger.error(f"Validation failed: {validation_errors}")
+                raise HTTPException(
+                    status_code=400, 
+                    detail={
+                        "message": "Invalid request data",
+                        "errors": validation_errors
+                    }
+                )
             
             logger.info("Step 1: Parsing OpenAPI spec...")
             # Parse OpenAPI spec with timeout
@@ -153,7 +164,14 @@ async def predict_next_api_call(request: PredictionRequest):
                 logger.info(f"OpenAPI parsed: {spec_data.get('title', 'Unknown')} with {len(spec_data.get('endpoints', []))} endpoints")
             except Exception as e:
                 logger.error(f"OpenAPI parsing failed: {e}")
-                raise HTTPException(status_code=500, detail=f"Failed to parse OpenAPI spec: {str(e)}")
+                raise HTTPException(
+                    status_code=500, 
+                    detail={
+                        "message": "Failed to parse OpenAPI specification",
+                        "error": str(e),
+                        "suggestion": "Please check that the spec_url is valid and accessible"
+                    }
+                )
             
             logger.info("Step 2: Generating candidates...")
             # Generate candidates using AI layer with timeout
@@ -169,11 +187,18 @@ async def predict_next_api_call(request: PredictionRequest):
                     default=[]
                 )
                 if not candidates:
-                    raise Exception("No candidates generated")
+                    raise Exception("No candidates generated - this may indicate an issue with the AI layer or spec parsing")
                 logger.info(f"Generated {len(candidates)} candidates")
             except Exception as e:
                 logger.error(f"Candidate generation failed: {e}")
-                raise HTTPException(status_code=500, detail=f"Failed to generate candidates: {str(e)}")
+                raise HTTPException(
+                    status_code=500, 
+                    detail={
+                        "message": "Failed to generate prediction candidates",
+                        "error": str(e),
+                        "suggestion": "Try simplifying your prompt or check if OpenAI API key is configured"
+                    }
+                )
             
             logger.info("Step 3: Ranking candidates...")
             # Rank candidates using ML layer with timeout
@@ -190,7 +215,7 @@ async def predict_next_api_call(request: PredictionRequest):
                     default=[]
                 )
                 if not ranked_predictions:
-                    raise Exception("No predictions ranked")
+                    raise Exception("No predictions ranked - this may indicate an issue with the ML layer")
                 
                 # Track if ML was used
                 tracker.ml_used = prediction_ranker.is_trained
@@ -198,7 +223,40 @@ async def predict_next_api_call(request: PredictionRequest):
                 logger.info(f"Ranked {len(ranked_predictions)} predictions")
             except Exception as e:
                 logger.error(f"Ranking failed: {e}")
-                raise HTTPException(status_code=500, detail=f"Failed to rank candidates: {str(e)}")
+                raise HTTPException(
+                    status_code=500, 
+                    detail={
+                        "message": "Failed to rank prediction candidates",
+                        "error": str(e),
+                        "suggestion": "The system will retry with fallback ranking methods"
+                    }
+                )
+            
+            logger.info("Step 4: Enhancing predictions with parameters...")
+            # Enhance predictions with better parameters
+            try:
+                user_context = parameter_generator.extract_user_context(request.events)
+                
+                for prediction in ranked_predictions:
+                    # Find matching endpoint data
+                    endpoint_data = None
+                    for ep in spec_data.get('endpoints', []):
+                        if ep['endpoint'] == prediction['endpoint']:
+                            endpoint_data = ep
+                            break
+                    
+                    if endpoint_data:
+                        # Generate enhanced parameters
+                        enhanced_params = parameter_generator.generate_parameters(
+                            endpoint_data, user_context
+                        )
+                        # Merge with existing params, prioritizing existing ones
+                        prediction['params'] = {**enhanced_params, **prediction.get('params', {})}
+                
+                logger.info("Enhanced predictions with generated parameters")
+            except Exception as e:
+                logger.warning(f"Parameter enhancement failed: {e}")
+                # Don't fail the request for parameter enhancement issues
             
             # Return top k predictions
             top_predictions = ranked_predictions[:request.k]
@@ -218,7 +276,14 @@ async def predict_next_api_call(request: PredictionRequest):
         except Exception as e:
             processing_time = int((time.time() - tracker.start_time) * 1000) if tracker.start_time else 0
             logger.error(f"Unexpected error in prediction after {processing_time}ms: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+            raise HTTPException(
+                status_code=500, 
+                detail={
+                    "message": "Internal server error occurred during prediction",
+                    "error": str(e),
+                    "processing_time_ms": processing_time
+                }
+            )
 
 @app.get("/")
 async def root():
