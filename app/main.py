@@ -183,7 +183,8 @@ async def predict_next_api_call(request: PredictionRequest):
                         candidates=candidates,
                         events=request.events,
                         prompt=request.prompt,
-                        user_id=request.user_id
+                        user_id=request.user_id,
+                        spec_data=spec_data  # Pass spec_data for cold-start handling
                     ),
                     timeout_seconds=5.0,
                     default=[]

@@ -4,6 +4,7 @@ from typing import List, Dict, Any, Optional
 import pandas as pd
 import numpy as np
 from .trainer import MLModelTrainer
+from ..utils.cold_start import ColdStartHandler
 
 logger = logging.getLogger(__name__)
 
@@ -14,7 +15,9 @@ class PredictionRanker:
     
     def __init__(self):
         self.ml_trainer = MLModelTrainer()
+        self.cold_start_handler = ColdStartHandler()
         self.is_trained = False
+        self.training_samples = 0
         
     async def load_model(self):
         """Load pre-trained model or train if not available"""
@@ -23,22 +26,26 @@ class PredictionRanker:
             if self.ml_trainer.load_model():
                 logger.info("ML model loaded successfully")
                 self.is_trained = True
+                self.training_samples = 1000  # Assume default training size
             else:
                 # Train a new model if none exists
                 logger.info("No ML model found, training new model...")
-                metrics = self.ml_trainer.train_model(n_samples=1000)  # Smaller for faster startup
-                logger.info(f"New model trained with metrics: {metrics}")
+                metrics = self.ml_trainer.train_model(n_samples=1000)
+                self.training_samples = metrics.get('n_samples', 1000)
+                logger.info(f"New model trained with {self.training_samples} samples, metrics: {metrics}")
                 self.is_trained = True
         except Exception as e:
             logger.error(f"Error with ML model: {e}. Falling back to heuristics.")
             self.is_trained = False
+            self.training_samples = 0
     
     async def rank_candidates(
         self, 
         candidates: List[Dict[str, Any]], 
         events: List[Any],  # APIEvent Pydantic models
         prompt: Optional[str], 
-        user_id: str
+        user_id: str,
+        spec_data: Optional[Dict[str, Any]] = None
     ) -> List[Dict[str, Any]]:
         """
         Rank candidate predictions and return scored results
@@ -46,8 +53,25 @@ class PredictionRanker:
         if not candidates:
             return []
         
+        # Check for cold-start conditions
+        is_cold_start, cold_start_reason = self.cold_start_handler.is_cold_start(
+            events=events,
+            model_trained=self.is_trained,
+            model_samples=self.training_samples
+        )
+        
         try:
-            if self.is_trained and self.ml_trainer.model is not None:
+            if is_cold_start and spec_data:
+                # Use cold-start predictions instead of ranking candidates
+                logger.info(f"Using cold-start predictions: {cold_start_reason}")
+                scored_candidates = self.cold_start_handler.generate_cold_start_predictions(
+                    events=events,
+                    prompt=prompt,
+                    spec_data=spec_data,
+                    k=len(candidates),
+                    reason=cold_start_reason
+                )
+            elif self.is_trained and self.ml_trainer.model is not None and not is_cold_start:
                 # Use ML model for ranking
                 scored_candidates = self._ml_rank(candidates, events, prompt)
                 logger.info(f"Used ML model for ranking {len(candidates)} candidates")
@@ -69,7 +93,7 @@ class PredictionRanker:
                     'endpoint': c['endpoint'],
                     'params': c.get('params', {}),
                     'score': 0.5,
-                    'why': c.get('reasoning', 'Default ranking due to error')
+                    'why': f"Default ranking due to error: {str(e)}"
                 }
                 for c in candidates
             ]
