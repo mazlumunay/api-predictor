@@ -1,6 +1,8 @@
 import os
 import json
 import logging
+import time
+import asyncio
 from typing import List, Dict, Any, Optional
 
 # Try to import OpenAI with fallback
@@ -15,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 class CandidateGenerator:
     """
-    AI layer that generates candidate API calls using LLM
+    Optimized AI layer that generates candidate API calls using LLM
     """
     
     def __init__(self):
@@ -28,11 +30,19 @@ class CandidateGenerator:
             self.client = None
         else:
             try:
-                self.client = AsyncOpenAI(api_key=api_key)
+                self.client = AsyncOpenAI(
+                    api_key=api_key,
+                    timeout=10.0,  # Global timeout for all requests
+                    max_retries=1   # Reduce retries for faster failure
+                )
                 logger.info("OpenAI client initialized successfully")
             except Exception as e:
                 logger.error(f"Failed to initialize OpenAI client: {e}. Using fallback.")
                 self.client = None
+        
+        # Cache for similar requests
+        self.request_cache = {}
+        self.cache_max_age = 300  # 5 minutes
         
     async def generate_candidates(
         self, 
@@ -42,20 +52,30 @@ class CandidateGenerator:
         k: int
     ) -> List[Dict[str, Any]]:
         """
-        Generate candidate API calls using LLM
+        Generate candidate API calls using optimized LLM approach
         """
         try:
-            if self.client:
-                # Use OpenAI for generation
-                candidates = await self._generate_with_openai(events, prompt, spec_data, k)
-            else:
-                # Fallback to heuristic generation
-                candidates = self._generate_fallback_candidates(events, spec_data, k)
+            # Check cache first for similar requests
+            cache_key = self._generate_cache_key(events, prompt, spec_data, k)
+            cached_candidates = self._get_cached_candidates(cache_key)
+            if cached_candidates:
+                logger.info("Using cached AI candidates")
+                return cached_candidates[:k * 2]
             
-            # Ensure we have at least k candidates
+            candidates = []
+            
+            if self.client:
+                # Use optimized OpenAI generation
+                candidates = await self._generate_with_openai_optimized(events, prompt, spec_data, k)
+            
+            # Always add fallback candidates for robustness
             if len(candidates) < k:
-                fallback = self._generate_fallback_candidates(events, spec_data, k - len(candidates))
+                fallback = self._generate_fallback_candidates(events, spec_data, k * 2 - len(candidates))
                 candidates.extend(fallback)
+            
+            # Cache successful results
+            if candidates:
+                self._cache_candidates(cache_key, candidates)
             
             return candidates[:k * 2]  # Return extra for ML layer to rank
             
@@ -64,92 +84,86 @@ class CandidateGenerator:
             # Fallback to heuristic candidates
             return self._generate_fallback_candidates(events, spec_data, k * 2)
     
-    async def _generate_with_openai(
+    async def _generate_with_openai_optimized(
         self, 
         events: List[Any], 
         prompt: Optional[str], 
         spec_data: Dict[str, Any], 
         k: int
     ) -> List[Dict[str, Any]]:
-        """Generate candidates using OpenAI"""
+        """Generate candidates using optimized OpenAI calls"""
         
-        # Build context for LLM
-        context = self._build_context(events, prompt, spec_data, k)
+        # Build minimal context for faster processing
+        context = self._build_optimized_context(events, prompt, spec_data, k)
         
         try:
-            response = await self.client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": "You are an expert API prediction system. Always respond with valid JSON arrays."},
-                    {"role": "user", "content": context}
-                ],
-                temperature=0.3,
-                max_tokens=1500
+            # Optimized OpenAI call with reduced latency
+            response = await asyncio.wait_for(
+                self.client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": "Generate API predictions as concise JSON array. Be fast and accurate."},
+                        {"role": "user", "content": context}
+                    ],
+                    temperature=0.1,  # Lower temperature for faster, more deterministic responses
+                    max_tokens=600,   # Reduced from 1500 for faster processing
+                    top_p=0.9,       # Reduce sampling space for speed
+                    frequency_penalty=0,  # No penalties for speed
+                    presence_penalty=0
+                ),
+                timeout=8.0  # 8 second timeout
             )
             
             response_text = response.choices[0].message.content
             candidates = self._parse_openai_response(response_text, spec_data)
             
+            logger.info(f"OpenAI generated {len(candidates)} candidates")
             return candidates
             
+        except asyncio.TimeoutError:
+            logger.warning("OpenAI request timed out, using fallback")
+            return []
         except Exception as e:
-            logger.error(f"OpenAI API error: {e}")
+            logger.warning(f"OpenAI API error: {e}")
             return []
     
-    def _build_context(
+    def _build_optimized_context(
         self, 
         events: List[Any], 
         prompt: Optional[str], 
         spec_data: Dict[str, Any], 
         k: int
     ) -> str:
-        """Build context prompt for LLM"""
+        """Build minimal context prompt for faster LLM processing"""
         
-        # Recent events summary - fix the Pydantic model access
+        # Only last 3 events for speed
         events_summary = "\n".join([
-            f"- {event.endpoint} with params: {event.params}"
-            for event in events[-5:]  # Last 5 events
+            f"- {event.endpoint}"
+            for event in events[-3:]  # Reduced from 5
         ])
         
-        # Available endpoints (sample)
+        # Only top 8 endpoints for speed
         endpoints_sample = "\n".join([
-            f"- {ep['endpoint']}: {ep.get('summary', 'No description')}"
-            for ep in spec_data.get('endpoints', [])[:15]  # First 15 endpoints
+            f"- {ep['endpoint']}"
+            for ep in spec_data.get('endpoints', [])[:8]  # Reduced from 15
         ])
         
-        context = f"""You are predicting the next API call for a user of {spec_data.get('title', 'this API')}.
-
-RECENT USER ACTIVITY:
+        # Simplified, shorter context
+        context = f"""Recent actions:
 {events_summary}
 
-USER INTENT: {prompt or 'No specific intent provided'}
+Intent: {prompt or 'Continue workflow'}
 
-AVAILABLE ENDPOINTS (sample):
+Available API endpoints:
 {endpoints_sample}
 
-TASK: Generate {k} most likely next API calls.
-
-RULES:
-1. Never suggest DELETE operations unless explicitly requested
-2. Use realistic parameter values based on recent activity  
-3. Consider typical API workflows
-4. Provide clear reasoning
-
-Return as JSON array:
-[
-  {{
-    "endpoint": "POST /invoices",
-    "params": {{"customer_id": "cus_123", "amount": 5000}},
-    "reasoning": "User recently updated invoice status, creating new invoice is logical next step"
-  }}
-]
-
-Generate exactly {k} predictions:"""
+Generate {k} likely next API calls as JSON array:
+[{{"endpoint": "METHOD /path", "params": {{}}, "reasoning": "brief reason"}}]"""
 
         return context
     
     def _parse_openai_response(self, response: str, spec_data: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Parse and validate OpenAI response"""
+        """Parse and validate OpenAI response with error tolerance"""
         try:
             # Clean up response
             response = response.strip()
@@ -158,7 +172,18 @@ Generate exactly {k} predictions:"""
             elif response.startswith('```'):
                 response = response[3:-3]
             
-            candidates_raw = json.loads(response)
+            # Try to parse JSON
+            try:
+                candidates_raw = json.loads(response)
+            except json.JSONDecodeError:
+                # Try to extract JSON from text
+                import re
+                json_match = re.search(r'\[.*\]', response, re.DOTALL)
+                if json_match:
+                    candidates_raw = json.loads(json_match.group())
+                else:
+                    logger.warning("Could not parse OpenAI JSON response")
+                    return []
             
             # Validate and structure candidates
             candidates = []
@@ -180,22 +205,17 @@ Generate exactly {k} predictions:"""
             return []
     
     def _validate_candidate(self, candidate: Dict[str, Any], available_endpoints: List[str]) -> bool:
-        """Validate a candidate prediction"""
+        """Fast validation of candidate prediction"""
         endpoint = candidate.get('endpoint', '')
         
         # Basic validation
-        if not endpoint:
-            return False
-            
-        # Check if endpoint format is correct
-        if ' ' not in endpoint:
+        if not endpoint or ' ' not in endpoint:
             return False
             
         method = endpoint.split()[0].upper()
         if method not in ['GET', 'POST', 'PUT', 'PATCH', 'DELETE']:
             return False
         
-        # For now, allow any endpoint (we'll improve validation later)
         return True
     
     def _generate_fallback_candidates(
@@ -204,7 +224,7 @@ Generate exactly {k} predictions:"""
         spec_data: Dict[str, Any], 
         count: int
     ) -> List[Dict[str, Any]]:
-        """Generate fallback candidates using simple heuristics"""
+        """Generate fast fallback candidates using simple heuristics"""
         candidates = []
         endpoints = spec_data.get('endpoints', [])
         
@@ -213,10 +233,10 @@ Generate exactly {k} predictions:"""
         
         # Simple heuristics based on last action
         if events:
-            last_endpoint = events[-1].endpoint  # Fixed: use .endpoint instead of ['endpoint']
+            last_endpoint = events[-1].endpoint
             last_method = last_endpoint.split()[0]
             
-            # Common patterns
+            # Fast pattern matching
             if last_method == 'GET':
                 preferred_methods = ['POST', 'PUT']
             elif last_method == 'POST':
@@ -226,7 +246,7 @@ Generate exactly {k} predictions:"""
         else:
             preferred_methods = ['GET']
         
-        # Generate candidates
+        # Generate candidates quickly
         for method in preferred_methods:
             method_endpoints = [ep for ep in safe_endpoints if ep['endpoint'].startswith(method)]
             for ep in method_endpoints[:count]:
@@ -241,7 +261,7 @@ Generate exactly {k} predictions:"""
             if len(candidates) >= count:
                 break
         
-        # Fill remaining with GET endpoints if needed
+        # Fill with GET endpoints if needed
         if len(candidates) < count:
             get_endpoints = [ep for ep in safe_endpoints if ep['endpoint'].startswith('GET')]
             for ep in get_endpoints[:count - len(candidates)]:
@@ -253,3 +273,36 @@ Generate exactly {k} predictions:"""
                 })
         
         return candidates[:count]
+    
+    def _generate_cache_key(self, events: List[Any], prompt: Optional[str], spec_data: Dict[str, Any], k: int) -> str:
+        """Generate cache key for similar requests"""
+        events_key = '-'.join([event.endpoint.split()[0] for event in events[-3:]])
+        prompt_key = (prompt or 'no_prompt')[:20]
+        spec_key = spec_data.get('title', 'unknown')[:10]
+        return f"ai_candidates:{events_key}:{prompt_key}:{spec_key}:{k}"
+    
+    def _get_cached_candidates(self, cache_key: str) -> Optional[List[Dict[str, Any]]]:
+        """Get candidates from cache if recent enough"""
+        if cache_key in self.request_cache:
+            cached_item = self.request_cache[cache_key]
+            if time.time() - cached_item['timestamp'] < self.cache_max_age:
+                return cached_item['candidates']
+            else:
+                # Remove expired cache
+                del self.request_cache[cache_key]
+        return None
+    
+    def _cache_candidates(self, cache_key: str, candidates: List[Dict[str, Any]]):
+        """Cache candidates for reuse"""
+        self.request_cache[cache_key] = {
+            'candidates': candidates,
+            'timestamp': time.time()
+        }
+        
+        # Keep cache size reasonable
+        if len(self.request_cache) > 100:
+            # Remove oldest entries
+            oldest_keys = sorted(self.request_cache.keys(), 
+                               key=lambda k: self.request_cache[k]['timestamp'])[:50]
+            for key in oldest_keys:
+                del self.request_cache[key]
