@@ -43,26 +43,6 @@ class CandidateGenerator:
         # Cache for similar requests
         self.request_cache = {}
         self.cache_max_age = 300  # 5 minutes
-    
-    def _generate_demo_candidates(self, events, prompt, spec_data, k):
-        """Generate fast demo candidates without OpenAI calls"""
-        candidates = []
-        endpoints = spec_data.get('endpoints', [])[:k*2]
-        
-        for i, ep in enumerate(endpoints):
-            score = 0.9 - (i * 0.05)  # Decreasing scores
-            reasoning = f'Fast demo prediction for {ep["endpoint"].split()[0]} operation'
-            if prompt:
-                reasoning += f' matching intent: {prompt[:20]}...'
-            
-            candidates.append({
-                'endpoint': ep['endpoint'],
-                'params': {},
-                'reasoning': reasoning,
-                'source': 'demo_ai'
-            })
-        
-        return candidates[:k*2]
         
     async def generate_candidates(
         self, 
@@ -112,12 +92,6 @@ class CandidateGenerator:
         k: int
     ) -> List[Dict[str, Any]]:
         """Generate candidates using optimized OpenAI calls"""
-        
-        # Ultra-fast mode for submission demo
-        DEMO_MODE = os.getenv('DEMO_MODE', 'false').lower() == 'true'
-        if DEMO_MODE:
-            logger.info("Demo mode: using fast synthetic candidates")
-            return self._generate_demo_candidates(events, prompt, spec_data, k)
         
         # Build minimal context for faster processing
         context = self._build_optimized_context(events, prompt, spec_data, k)
